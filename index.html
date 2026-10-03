@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>BREAK — Your 5-Minute Escape • v19</title>
+<title>BREAK — Your 5-Minute Escape • v20</title>
 
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -654,6 +654,12 @@
   .chess-square.selected{box-shadow:inset 0 0 0 4px rgba(255,255,80,.9)}
   .chess-square.legal::after{content:"";position:absolute;width:18%;height:18%;border-radius:50%;background:rgba(0,0,0,.25)}
   .chess-square.capture::after{content:"";position:absolute;inset:7%;border:4px solid rgba(210,40,40,.72);border-radius:50%}
+  .chess-square.remote-from{box-shadow:inset 0 0 0 5px rgba(250,204,21,.92),inset 0 0 24px rgba(250,204,21,.30);animation:remotePulse .75s ease-out}
+  .chess-square.remote-to{box-shadow:inset 0 0 0 5px rgba(34,197,94,.95),inset 0 0 28px rgba(34,197,94,.28);animation:remotePulse .75s ease-out}
+  .chess-online-activity{margin-top:9px;min-height:22px;text-align:center;font-size:12px;font-weight:900;color:var(--text);opacity:.92}
+  .chess-online-activity.flash{animation:remoteFlash .75s ease-out}
+  @keyframes remotePulse{0%{filter:brightness(1.35)}100%{filter:brightness(1)}}
+  @keyframes remoteFlash{0%{transform:scale(1);opacity:1}45%{transform:scale(1.035);opacity:1}100%{transform:scale(1);opacity:.92}}
   .chess-piece{position:relative;z-index:2;filter:drop-shadow(0 2px 1px rgba(0,0,0,.35));font-family:"Segoe UI Symbol","Noto Sans Symbols 2",serif}
   .chess-piece.white{color:#fff;text-shadow:0 2px 2px rgba(0,0,0,.75),0 0 2px rgba(0,0,0,.8)}
   .chess-piece.black{color:#1d1d1d;text-shadow:0 1px 0 rgba(255,255,255,.15)}
@@ -1609,6 +1615,7 @@
             <div class="chess-board" id="chessBoard" aria-label="Chess board"></div>
             <div class="chess-tip" id="chessTip">🟡 legal move • 🔴 capture</div>
             <div class="chess-result" id="chessResult"></div>
+            <div class="chess-online-activity" id="chessOnlineActivity">Waiting for opponent…</div>
             <div class="chess-note" id="chessRoomStatus"></div>
           </div>
         </div>
@@ -1636,6 +1643,7 @@
     const resetBtn=document.getElementById('chessReset');
     const tipEl=document.getElementById('chessTip');
     const roomStatusEl=document.getElementById('chessRoomStatus');
+    const activityEl=document.getElementById('chessOnlineActivity');
     const setupMsg=document.getElementById('chessOnlineSetupMsg');
     const liveShareBox=document.getElementById('chessLiveShareBox');
     const liveShareLink=document.getElementById('chessLiveShareLink');
@@ -1653,7 +1661,20 @@
 
     let board=[],turn='w',selected=null,gameOver=false,legalCache=[],botThinking=false,botTimer=null;
     let mode='bot', onlineChannel=null, onlineRoom='', onlineRole='', onlineReady=false, onlinePeerId='';
-    let roomCheckTimer=null, roomResolved=false;
+    let roomCheckTimer=null, roomResolved=false, onlinePly=0, onlineLastAppliedPly=0;
+    let lastRemoteMove=null, activityTimer=null;
+    let onlineConnected=false;
+
+    function setActivity(text,flash=false){
+      activityEl.textContent=text;
+      if(flash){
+        activityEl.classList.remove('flash');
+        void activityEl.offsetWidth;
+        activityEl.classList.add('flash');
+        clearTimeout(activityTimer);
+        activityTimer=setTimeout(()=>activityEl.classList.remove('flash'),800);
+      }
+    }
 
     function initial(){
       if(botTimer){clearTimeout(botTimer);botTimer=null;}
@@ -1671,6 +1692,7 @@
       titleEl.textContent=mode==='bot'?'Your move':'Waiting for opponent';
       subEl.textContent=mode==='bot'?'You are White • The bot plays Black • Easy, quick rounds.':(onlineRole==='w'?'You are White • Send the link to a friend.':'You are Black • Waiting for White to move.');
       resultEl.textContent='';
+      setActivity(mode==='bot'?'🤖 You are playing the robot.':(onlineRole==='w'?'🟡 You are White • Waiting for your friend…':'⚪ You are Black • Waiting for White…'));
       render();
     }
 
@@ -1790,6 +1812,8 @@
       for(let r=0;r<8;r++)for(let c=0;c<8;c++){
         const sq=document.createElement('button');sq.type='button';sq.className='chess-square '+((r+c)%2?'dark':'light');
         if(selected&&selected[0]===r&&selected[1]===c)sq.classList.add('selected');
+        if(lastRemoteMove&&lastRemoteMove.from[0]===r&&lastRemoteMove.from[1]===c)sq.classList.add('remote-from');
+        if(lastRemoteMove&&lastRemoteMove.to[0]===r&&lastRemoteMove.to[1]===c)sq.classList.add('remote-to');
         const lm=legalCache.find(([rr,cc])=>rr===r&&cc===c);if(lm){sq.classList.add('legal');if(board[r][c])sq.classList.add('capture');}
         const p=board[r][c];if(p){const span=document.createElement('span');span.className='chess-piece '+(colorOf(p)==='w'?'white':'black');span.textContent=icons[p];sq.appendChild(span);}
         const rank=document.createElement('span');rank.className='chess-coord chess-rank';rank.textContent=8-r;sq.appendChild(rank);
@@ -1813,6 +1837,21 @@
       if(!finishTurn()&&mode==='bot'&&turn==='b')startBotTurn(); else render();
     }
 
+    async function playOnlineMove(move){
+      const moverColor=onlineRole;
+      if(moverColor!=='w'&&moverColor!=='b')return;
+      if(turn!==moverColor||!onlineReady)return;
+      const movedBoard=applyMove(board,move,moverColor);
+      board=movedBoard;selected=null;turn=moverColor==='w'?'b':'w';
+      onlinePly++;
+      lastRemoteMove=null;
+      const ended=finishTurn();
+      if(!ended)render();
+      setActivity('📤 Your move sent • Opponent is receiving it…');
+      await sendOnlinePacket({type:'move',ply:onlinePly,move});
+      await sendOnlinePacket({type:'state',ply:onlinePly,state:serializeState()});
+    }
+
     function clickSquare(r,c){
       const myColor=mode==='bot'?'w':onlineRole;
       if(gameOver||botThinking||!myColor||turn!==myColor)return;
@@ -1820,8 +1859,9 @@
       if(selected){
         const move=legalCache.find(([rr,cc])=>rr===r&&cc===c);
         if(move){
-          playLocalMove([selected[0],selected[1],r,c],myColor);
-          if(mode==='online')sendOnlineState();
+          const fullMove=[selected[0],selected[1],r,c];
+          if(mode==='online')playOnlineMove(fullMove);
+          else playLocalMove(fullMove,myColor);
           return;
         }
         if(p&&colorOf(p)===myColor){selected=[r,c];render();return;}
@@ -1854,7 +1894,7 @@
       if(roomCheckTimer){clearTimeout(roomCheckTimer);roomCheckTimer=null;}
       roomResolved=false;
       if(onlineChannel&&window.supabaseClient){try{await onlineChannel.untrack();}catch(e){}try{await window.supabaseClient.removeChannel(onlineChannel);}catch(e){}}
-      onlineChannel=null;onlineReady=false;onlineRoom='';onlineRole='';onlinePeerId='';
+      onlineChannel=null;onlineReady=false;onlineConnected=false;onlineRoom='';onlineRole='';onlinePeerId='';onlinePly=0;onlineLastAppliedPly=0;lastRemoteMove=null;
     }
 
     function resolveRoom(ok,msg){
@@ -1908,30 +1948,102 @@
       onlineChannel
         .on('presence',{event:'sync'},()=>checkGuestRoom())
         .on('presence',{event:'join'},()=>checkGuestRoom())
+        .on('presence',{event:'leave'},()=>{
+          if(onlineRole==='w'&&onlineReady){
+            onlineReady=false;
+            setActivity('🔴 Friend disconnected • Waiting to reconnect…');
+            roomStatusEl.textContent='🔴 Your friend left the game.';
+            render();
+          }
+        })
         .on('broadcast',{event:'chess'},payload=>{
           const data=payload?.payload||{};
           if(!data||data.peerId===onlinePeerId)return;
+
           if(data.type==='hello'){
             if(data.peerRole==='w'&&onlineRole==='b'){
               onlineReady=true;
               roomStatusEl.textContent='🟢 Friend connected • You are Black';
+              setActivity('⏳ Connected • Waiting for White…');
               sendOnlinePacket({type:'hello',peerRole:'b'});
+              sendOnlinePacket({type:'request_state'});
+              render();
             }
             if(data.peerRole==='b'&&onlineRole==='w'){
               onlineReady=true;
               roomStatusEl.textContent='🟢 Friend connected • You are White';
-              sendOnlinePacket({type:'state',state:serializeState()});
+              setActivity(turn===onlineRole?'♟️ Friend is connected • Your turn':'⏳ Friend is connected • Waiting for their move');
+              sendOnlinePacket({type:'state',ply:onlinePly,state:serializeState()});
               render();
             }
             return;
           }
-          if(data.type==='state'&&onlineRole==='b'){
-            if(!data.state)return;
-            applyRemoteState(data.state);onlineReady=true;roomStatusEl.textContent='🟢 Connected to your friend';render();
+
+          if(data.type==='request_state'&&onlineRole==='w'){
+            sendOnlinePacket({type:'state',ply:onlinePly,state:serializeState()});
             return;
           }
-          if(data.type==='reset'&&onlineRole==='b'){
-            initial();onlineReady=true;roomStatusEl.textContent='🔄 New game started by White';render();return;
+
+          if(data.type==='move'){
+            if(!Array.isArray(data.move)||data.move.length!==4)return;
+            if(data.peerRole===onlineRole)return;
+            const ply=Number(data.ply);
+            if(!Number.isInteger(ply))return;
+            if(ply<=onlineLastAppliedPly)return;
+            if(ply>onlinePly+1){
+              setActivity('🔄 Missed a move • Syncing with opponent…');
+              sendOnlinePacket({type:'request_state'});
+              return;
+            }
+            if(turn!==data.peerRole||gameOver)return;
+            const [r,c,rr,cc]=data.move;
+            const piece=board[r]?.[c];
+            if(!piece||colorOf(piece)!==data.peerRole)return;
+            const legal=legalMovesOn(board,data.peerRole).some(m=>m[0]===r&&m[1]===c&&m[2]===rr&&m[3]===cc);
+            if(!legal)return;
+            board=applyMove(board,data.move,data.peerRole);
+            onlinePly=ply;
+            onlineLastAppliedPly=ply;
+            selected=null;turn=onlineRole;
+            lastRemoteMove={from:[r,c],to:[rr,cc]};
+            const ended=finishTurn();
+            roomStatusEl.textContent='🟢 Opponent move received • Online synced';
+            setActivity('🔔 Opponent played • Your turn',true);
+            if(!ended)render();
+            return;
+          }
+
+          if(data.type==='state'){
+            if(!data.state)return;
+            const ply=Number(data.ply);
+            if(!Number.isInteger(ply)||ply<onlinePly)return;
+            if(ply===onlinePly){
+              // Same version: only refresh connection/status, never overwrite a newer local board.
+              onlineReady=true;
+              roomStatusEl.textContent='🟢 Online • Board up to date';
+              render();
+              return;
+            }
+            if(data.peerRole!==onlineRole){
+              applyRemoteState(data.state);
+              onlinePly=ply;
+              onlineLastAppliedPly=ply;
+              onlineReady=true;
+              lastRemoteMove=null;
+              roomStatusEl.textContent='🟢 Synced with your friend';
+              setActivity(turn===onlineRole?'🔔 Synced • Your turn':'⏳ Synced • Opponent turn',true);
+              render();
+            }
+            return;
+          }
+
+          if(data.type==='reset'){
+            onlinePly=0;onlineLastAppliedPly=0;lastRemoteMove=null;
+            initial();onlineReady=true;
+            roomStatusEl.textContent='🔄 New game started by White';
+            setActivity('🔄 New game • Waiting for White…',true);
+            render();
+            return;
           }
         });
 
@@ -1940,13 +2052,16 @@
           try{await onlineChannel.track({role,peerId:onlinePeerId,online_at:new Date().toISOString()});}catch(e){
             finish(false,'🔴 Could not join this room. Check Realtime/Pub access.');return;
           }
+          onlineConnected=true;
           onlineReady=true;
           if(role==='w'){
             roomStatusEl.textContent='🟡 Room created • Waiting for your friend…';
+            setActivity('🟡 Share the link • Waiting for your friend…');
             await sendOnlinePacket({type:'hello',peerRole:'w'});
             finish(true);
           }else{
             roomStatusEl.textContent='🔎 Checking room…';
+            setActivity('🔎 Checking online room…');
             checkGuestRoom();
             roomCheckTimer=setTimeout(()=>{
               if(!roomResolved)finish(false,'❌ Room not found. Ask your friend for a fresh link.');
@@ -1955,6 +2070,8 @@
           render();
         }else if(status==='CHANNEL_ERROR'||status==='TIMED_OUT'||status==='CLOSED'){
           onlineReady=false;
+          onlineConnected=false;
+          setActivity('🔴 Connection problem');
           finish(false,'🔴 Connection problem. Check Supabase Realtime settings.');
         }
       });
@@ -1968,8 +2085,20 @@
       titleEl.textContent=state.title||'Your move';subEl.textContent=state.sub||'';resultEl.textContent=state.result||'';
     }
     async function sendOnlinePacket(payload){
-      if(!onlineChannel||!onlineReady)return;
-      try{await onlineChannel.send({type:'broadcast',event:'chess',payload:{...payload,peerId:onlinePeerId,peerRole:onlineRole}});}catch(e){roomStatusEl.textContent='⚠️ Could not send the move.';}
+      if(!onlineChannel||!onlineConnected)return false;
+      try{
+        const res=await onlineChannel.send({type:'broadcast',event:'chess',payload:{...payload,peerId:onlinePeerId,peerRole:onlineRole}});
+        if(res&&res==='error')throw new Error('broadcast error');
+        return true;
+      }catch(e){
+        roomStatusEl.textContent='⚠️ Could not send the move. Retrying…';
+        setTimeout(async()=>{
+          if(onlineChannel&&onlineConnected){
+            try{await onlineChannel.send({type:'broadcast',event:'chess',payload:{...payload,peerId:onlinePeerId,peerRole:onlineRole}});}catch{}
+          }
+        },180);
+        return false;
+      }
     }
     function sendOnlineState(){sendOnlinePacket({type:'state',state:serializeState()});}
 
@@ -1980,6 +2109,7 @@
       liveShareBox.style.display=role==='w'?'block':'none';
       initial();
       roomStatusEl.textContent='🟡 Connecting…';
+      setActivity(role==='w'?'🟡 Creating online room…':'🟡 Connecting to your friend…');
       const ok=await connectRoom(room,role);
       if(!ok){
         play.style.display='none';onlineSetup.style.display='block';menu.style.display='none';
@@ -2032,11 +2162,11 @@
 
     resetBtn.addEventListener('click',async()=>{
       if(mode==='bot'){initial();return;}
-      if(onlineRole==='w'){initial();await sendOnlinePacket({type:'reset'});sendOnlineState();}
+      if(onlineRole==='w'){onlinePly=0;onlineLastAppliedPly=0;lastRemoteMove=null;initial();await sendOnlinePacket({type:'reset'});await sendOnlinePacket({type:'state',ply:0,state:serializeState()});}
       else roomStatusEl.textContent='ℹ️ Only White can start a new online game.';
     });
 
-    cleanupGame=()=>{if(botTimer)clearTimeout(botTimer);botTimer=null;disconnectOnline();boardEl.innerHTML='';selected=null;gameOver=true;botThinking=false;};
+    cleanupGame=()=>{if(botTimer)clearTimeout(botTimer);botTimer=null;clearTimeout(activityTimer);disconnectOnline();boardEl.innerHTML='';selected=null;gameOver=true;botThinking=false;};
 
     /* A shared ?room=... link starts the Black join flow, but the room must actually exist. */
     const incomingRoom=cleanRoom(new URLSearchParams(location.search).get('room'));
