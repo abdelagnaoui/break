@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>BREAK — Your 5-Minute Escape • v16</title>
+<title>BREAK — Your 5-Minute Escape • v19</title>
 
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -1594,6 +1594,13 @@
         <div id="chessPlay" style="display:none;">
           <div class="stage-title" id="chessTitle">Your move</div>
           <div class="stage-sub" id="chessSub"></div>
+          <div class="chess-share" id="chessLiveShareBox">
+            <div class="chess-online-badge">🟢 Share this game with your friend</div>
+            <input class="chess-share-link" id="chessLiveShareLink" readonly>
+            <div class="chess-share-actions">
+              <button class="chess-online-btn" id="copyChessLiveLink" type="button">📋 Copy Link</button>
+            </div>
+          </div>
           <div class="chess-wrap">
             <div class="chess-top">
               <div class="chess-status" id="chessStatus">♙ Your turn</div>
@@ -1630,6 +1637,9 @@
     const tipEl=document.getElementById('chessTip');
     const roomStatusEl=document.getElementById('chessRoomStatus');
     const setupMsg=document.getElementById('chessOnlineSetupMsg');
+    const liveShareBox=document.getElementById('chessLiveShareBox');
+    const liveShareLink=document.getElementById('chessLiveShareLink');
+    const copyLiveLink=document.getElementById('copyChessLiveLink');
 
     const icons={K:"♔",Q:"♕",R:"♖",B:"♗",N:"♘",P:"♙",k:"♚",q:"♛",r:"♜",b:"♝",n:"♞",p:"♟"};
     const files=['a','b','c','d','e','f','g','h'];
@@ -1643,6 +1653,7 @@
 
     let board=[],turn='w',selected=null,gameOver=false,legalCache=[],botThinking=false,botTimer=null;
     let mode='bot', onlineChannel=null, onlineRoom='', onlineRole='', onlineReady=false, onlinePeerId='';
+    let roomCheckTimer=null, roomResolved=false;
 
     function initial(){
       if(botTimer){clearTimeout(botTimer);botTimer=null;}
@@ -1819,60 +1830,136 @@
       if(p&&colorOf(p)===myColor){selected=[r,c];render();}
     }
 
-    /* ===== ONLINE (Supabase Realtime Broadcast) ===== */
+    /* ===== ONLINE (Supabase Realtime Broadcast + Presence) ===== */
     function hasSupabaseConfig(){
-      return window.supabase&&CHESS_ONLINE_CONFIG.SUPABASE_URL.startsWith('https://')&&CHESS_ONLINE_CONFIG.SUPABASE_KEY.startsWith('sb_');
+      return window.supabase&&CHESS_ONLINE_CONFIG.SUPABASE_URL.startsWith('https://')&&CHESS_ONLINE_CONFIG.SUPABASE_KEY.startsWith('sb_publishable_');
     }
     function makeRoom(){
-      const bytes=new Uint8Array(4);crypto.getRandomValues(bytes);
-      return Array.from(bytes).map(x=>x.toString(36).toUpperCase().padStart(2,'0')).join('').slice(0,7);
+      const bytes=new Uint8Array(5);crypto.getRandomValues(bytes);
+      return Array.from(bytes).map(x=>x.toString(36).toUpperCase().padStart(2,'0')).join('').slice(0,8);
     }
     function makePeerId(){return crypto.randomUUID?crypto.randomUUID():Math.random().toString(36).slice(2)+Date.now();}
     function cleanRoom(v){return String(v||'').replace(/[^a-z0-9]/gi,'').toUpperCase().slice(0,8);}
 
+    function getPresenceUsers(){
+      if(!onlineChannel) return [];
+      const state=onlineChannel.presenceState()||{};
+      return Object.values(state).flat().filter(Boolean);
+    }
+    function hasRole(role, excludeSelf=true){
+      return getPresenceUsers().some(p=>p&&p.role===role&&(!excludeSelf||p.peerId!==onlinePeerId));
+    }
+
     async function disconnectOnline(){
-      if(onlineChannel&&window.supabaseClient){try{await window.supabaseClient.removeChannel(onlineChannel);}catch(e){}}
+      if(roomCheckTimer){clearTimeout(roomCheckTimer);roomCheckTimer=null;}
+      roomResolved=false;
+      if(onlineChannel&&window.supabaseClient){try{await onlineChannel.untrack();}catch(e){}try{await window.supabaseClient.removeChannel(onlineChannel);}catch(e){}}
       onlineChannel=null;onlineReady=false;onlineRoom='';onlineRole='';onlinePeerId='';
+    }
+
+    function resolveRoom(ok,msg){
+      if(roomResolved)return;
+      roomResolved=true;
+      if(roomCheckTimer){clearTimeout(roomCheckTimer);roomCheckTimer=null;}
+      if(msg)roomStatusEl.textContent=msg;
+      return ok;
     }
 
     async function connectRoom(room,role){
       if(!hasSupabaseConfig()){
-        roomStatusEl.textContent='⚠️ Online is not configured yet. Add your Supabase URL + Publishable key in CHESS_ONLINE_CONFIG.';return false;
+        roomStatusEl.textContent='⚠️ Online is not configured. Check the Supabase publishable key.';
+        return false;
       }
       await disconnectOnline();
       onlineRoom=cleanRoom(room);onlineRole=role;onlinePeerId=makePeerId();mode='online';
+      if(!onlineRoom || onlineRoom.length<4){
+        roomStatusEl.textContent='❌ Invalid room code.';return false;
+      }
+
       const client=window.supabase.createClient(CHESS_ONLINE_CONFIG.SUPABASE_URL,CHESS_ONLINE_CONFIG.SUPABASE_KEY);
       window.supabaseClient=client;
-      onlineChannel=client.channel('mini-chess-'+onlineRoom,{config:{broadcast:{ack:true}}});
-      onlineChannel.on('broadcast',{event:'chess'},payload=>{
-        const data=payload?.payload||{};
-        if(!data||data.peerId===onlinePeerId)return;
-        if(data.type==='hello'){
-          if(onlineRole==='w')sendOnlinePacket({type:'state',state:serializeState()});
-          if(data.peerRole==='w'&&onlineRole==='b'){
-            roomStatusEl.textContent='🟢 Friend connected • You are Black';onlineReady=true;render();
+      onlineChannel=client.channel('mini-chess-'+onlineRoom,{config:{broadcast:{ack:true},presence:{key:onlinePeerId}}});
+
+      let finishResolve;
+      const resultPromise=new Promise(r=>finishResolve=r);
+      const finish=(ok,msg)=>{
+        if(roomResolved)return;
+        roomResolved=true;
+        if(roomCheckTimer){clearTimeout(roomCheckTimer);roomCheckTimer=null;}
+        if(msg)roomStatusEl.textContent=msg;
+        finishResolve(ok);
+      };
+
+      const checkGuestRoom=()=>{
+        if(role!=='b'||roomResolved||!onlineChannel)return;
+        const hasHost=hasRole('w',true);
+        const hasOtherGuest=hasRole('b',true);
+        if(hasHost){
+          onlineReady=true;
+          roomStatusEl.textContent='🟢 Friend found • You are Black';
+          sendOnlinePacket({type:'hello',peerRole:'b'});
+          finish(true);
+        }else if(hasOtherGuest){
+          onlineReady=false;
+          finish(false,'❌ This room already has two players.');
+        }
+      };
+
+      onlineChannel
+        .on('presence',{event:'sync'},()=>checkGuestRoom())
+        .on('presence',{event:'join'},()=>checkGuestRoom())
+        .on('broadcast',{event:'chess'},payload=>{
+          const data=payload?.payload||{};
+          if(!data||data.peerId===onlinePeerId)return;
+          if(data.type==='hello'){
+            if(data.peerRole==='w'&&onlineRole==='b'){
+              onlineReady=true;
+              roomStatusEl.textContent='🟢 Friend connected • You are Black';
+              sendOnlinePacket({type:'hello',peerRole:'b'});
+            }
+            if(data.peerRole==='b'&&onlineRole==='w'){
+              onlineReady=true;
+              roomStatusEl.textContent='🟢 Friend connected • You are White';
+              sendOnlinePacket({type:'state',state:serializeState()});
+              render();
+            }
+            return;
           }
-          return;
-        }
-        if(data.type==='state'&&onlineRole==='b'){
-          if(!data.state)return;
-          applyRemoteState(data.state);onlineReady=true;roomStatusEl.textContent='🟢 Connected to your friend';render();
-          return;
-        }
-        if(data.type==='reset'&&onlineRole==='b'){
-          initial();onlineReady=true;roomStatusEl.textContent='🔄 New game started by White';render();return;
-        }
-      });
-      onlineChannel.subscribe(status=>{
+          if(data.type==='state'&&onlineRole==='b'){
+            if(!data.state)return;
+            applyRemoteState(data.state);onlineReady=true;roomStatusEl.textContent='🟢 Connected to your friend';render();
+            return;
+          }
+          if(data.type==='reset'&&onlineRole==='b'){
+            initial();onlineReady=true;roomStatusEl.textContent='🔄 New game started by White';render();return;
+          }
+        });
+
+      onlineChannel.subscribe(async status=>{
         if(status==='SUBSCRIBED'){
-          onlineReady=true;roomStatusEl.textContent=role==='w'?'🟡 Waiting for a friend…':'🟢 Connected • waiting for game state…';
-          sendOnlinePacket({type:'hello',peerRole:role});
+          try{await onlineChannel.track({role,peerId:onlinePeerId,online_at:new Date().toISOString()});}catch(e){
+            finish(false,'🔴 Could not join this room. Check Realtime/Pub access.');return;
+          }
+          onlineReady=true;
+          if(role==='w'){
+            roomStatusEl.textContent='🟡 Room created • Waiting for your friend…';
+            await sendOnlinePacket({type:'hello',peerRole:'w'});
+            finish(true);
+          }else{
+            roomStatusEl.textContent='🔎 Checking room…';
+            checkGuestRoom();
+            roomCheckTimer=setTimeout(()=>{
+              if(!roomResolved)finish(false,'❌ Room not found. Ask your friend for a fresh link.');
+            },3500);
+          }
           render();
         }else if(status==='CHANNEL_ERROR'||status==='TIMED_OUT'||status==='CLOSED'){
-          onlineReady=false;roomStatusEl.textContent='🔴 Connection problem. Check your Supabase settings.';render();
+          onlineReady=false;
+          finish(false,'🔴 Connection problem. Check Supabase Realtime settings.');
         }
       });
-      return true;
+
+      return await resultPromise;
     }
 
     function serializeState(){return {board,turn,gameOver,title:titleEl.textContent,sub:subEl.textContent,result:resultEl.textContent};}
@@ -1887,31 +1974,61 @@
     function sendOnlineState(){sendOnlinePacket({type:'state',state:serializeState()});}
 
     async function openOnlineGame(role,room){
-      mode='online';menu.style.display='none';onlineSetup.style.display='none';play.style.display='block';
+      menu.style.display='none';onlineSetup.style.display='none';play.style.display='block';
       tipEl.textContent='🌐 Online • 🟡 legal move • 🔴 capture';
       resetBtn.textContent=role==='w'?'↻ New Game':'↻ Ask for New Game';
+      liveShareBox.style.display=role==='w'?'block':'none';
       initial();
       roomStatusEl.textContent='🟡 Connecting…';
-      await connectRoom(room,role);
-      if(role==='w'&&room){const u=new URL(location.href);u.searchParams.set('room',room);shareLink.value=u.toString();shareBox.style.display='block';}
+      const ok=await connectRoom(room,role);
+      if(!ok){
+        play.style.display='none';onlineSetup.style.display='block';menu.style.display='none';
+        shareBox.style.display='none';
+        return false;
+      }
+      if(role==='w'&&room){
+        const u=new URL(location.href);u.searchParams.set('room',cleanRoom(room));
+        const link=u.toString();
+        shareLink.value=link;liveShareLink.value=link;shareBox.style.display='block';liveShareBox.style.display='block';
+      }
+      render();
+      return true;
     }
 
     function showBot(){
-      mode='bot';menu.style.display='none';onlineSetup.style.display='none';play.style.display='block';tipEl.textContent='🤖 Bot plays Black • 🟡 legal move • 🔴 capture';resetBtn.textContent='↻ New Game';roomStatusEl.textContent='';initial();
+      mode='bot';menu.style.display='none';onlineSetup.style.display='none';play.style.display='block';liveShareBox.style.display='none';tipEl.textContent='🤖 Bot plays Black • 🟡 legal move • 🔴 capture';resetBtn.textContent='↻ New Game';roomStatusEl.textContent='';initial();
     }
 
     botMode.addEventListener('click',showBot);
     onlineMode.addEventListener('click',()=>{
-      menu.style.display='none';onlineSetup.style.display='block';play.style.display='none';
-      setupMsg.innerHTML=hasSupabaseConfig()?'✅ Online is configured. Create a game and send the link.':'⚠️ Add your Supabase <b>Project URL</b> and <b>Publishable key</b> to <b>CHESS_ONLINE_CONFIG</b> in this HTML before publishing.';
+      menu.style.display='none';onlineSetup.style.display='block';play.style.display='none';liveShareBox.style.display='none';
+      setupMsg.innerHTML=hasSupabaseConfig()?'✅ Online is configured. Create a game and send the link.':'⚠️ Check your Supabase <b>Project URL</b> and <b>Publishable key</b> in <b>CHESS_ONLINE_CONFIG</b>.';
       const incoming=new URLSearchParams(location.search).get('room');
-      if(incoming){joinRoomInput.value=cleanRoom(incoming);joinHint.textContent='🔗 You opened a shared chess link — enter the room above and tap Join.';}else{joinHint.textContent='';}
+      if(incoming){joinRoomInput.value=cleanRoom(incoming);joinHint.textContent='🔗 Shared link detected. Tap Join to connect to the room.';}else{joinHint.textContent='';}
     });
-    backMode.addEventListener('click',()=>{mode='bot';menu.style.display='block';onlineSetup.style.display='none';play.style.display='none';});
-    createRoomBtn.addEventListener('click',async()=>{const room=makeRoom();const u=new URL(location.href);u.searchParams.set('room',room);shareLink.value=u.toString();shareBox.style.display='block';await openOnlineGame('w',room);});
-    joinBtn.addEventListener('click',async()=>{const room=cleanRoom(joinRoomInput.value);if(!room){setupMsg.textContent='Enter a room code.';return;}await openOnlineGame('b',room);});
+    backMode.addEventListener('click',()=>{mode='bot';menu.style.display='block';onlineSetup.style.display='none';play.style.display='none';liveShareBox.style.display='none';});
+    createRoomBtn.addEventListener('click',async()=>{
+      const room=makeRoom();
+      const u=new URL(location.href);u.searchParams.set('room',room);
+      const link=u.toString();
+      shareLink.value=link;shareBox.style.display='block';setupMsg.textContent='🟢 Game created. Share the link with your friend.';
+      await openOnlineGame('w',room);
+    });
+    joinBtn.addEventListener('click',async()=>{
+      const room=cleanRoom(joinRoomInput.value);
+      if(room.length<4){setupMsg.textContent='❌ Enter a valid room code (at least 4 characters).';return;}
+      setupMsg.textContent='🔎 Checking room…';
+      await openOnlineGame('b',room);
+    });
     joinRoomInput.addEventListener('input',()=>joinRoomInput.value=cleanRoom(joinRoomInput.value));
-    copyLink.addEventListener('click',async()=>{try{await navigator.clipboard.writeText(shareLink.value);copyLink.textContent='✅ Copied!';setTimeout(()=>copyLink.textContent='📋 Copy Link',900);}catch(e){shareLink.select();document.execCommand('copy');copyLink.textContent='✅ Copied!';setTimeout(()=>copyLink.textContent='📋 Copy Link',900);}});
+    async function copyChessLinkValue(input,button){
+      const value=input.value;
+      if(!value)return;
+      try{await navigator.clipboard.writeText(value);button.textContent='✅ Copied!';setTimeout(()=>button.textContent='📋 Copy Link',1000);}
+      catch(e){input.select();document.execCommand('copy');button.textContent='✅ Copied!';setTimeout(()=>button.textContent='📋 Copy Link',1000);}
+    }
+    copyLink.addEventListener('click',()=>copyChessLinkValue(shareLink,copyLink));
+    copyLiveLink.addEventListener('click',()=>copyChessLinkValue(liveShareLink,copyLiveLink));
 
     resetBtn.addEventListener('click',async()=>{
       if(mode==='bot'){initial();return;}
@@ -1921,9 +2038,10 @@
 
     cleanupGame=()=>{if(botTimer)clearTimeout(botTimer);botTimer=null;disconnectOnline();boardEl.innerHTML='';selected=null;gameOver=true;botThinking=false;};
 
-    /* A shared ?room=... link auto-joins as Black when Mini Chess is opened. */
+    /* A shared ?room=... link starts the Black join flow, but the room must actually exist. */
     const incomingRoom=cleanRoom(new URLSearchParams(location.search).get('room'));
     if(incomingRoom){
+      joinRoomInput.value=incomingRoom;
       openOnlineGame('b',incomingRoom);
     }
   }
