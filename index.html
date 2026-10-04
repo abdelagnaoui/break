@@ -938,6 +938,7 @@
     let memStartedAt = 0;
     let memFinished = false;
     let memWaitingForHost = false;
+    let memResolving = false;
 
     // Bot memory is intentionally imperfect.
     // It remembers only some cards and can forget old ones, so it does not "know everything".
@@ -1107,6 +1108,10 @@
 
     function applyMemRemote(s){
       if(!s) return;
+      const incomingSeq=Number(s.seq)||0;
+      // Never let an older/in-flight broadcast overwrite a newer board state.
+      if(memState && incomingSeq <= (Number(memState.seq)||0)) return;
+
       memState = {
         deck:[...(s.deck||[])],
         matched:[...(s.matched||[])],
@@ -1115,8 +1120,9 @@
         moves:Number(s.moves)||0,
         scores:Array.isArray(s.scores)?[Number(s.scores[0])||0,Number(s.scores[1])||0]:[0,0],
         finished:!!s.finished,
-        seq:Number(s.seq)||0
+        seq:incomingSeq
       };
+      memResolving=false;
       renderMemGame();
 
       if(memState.finished){
@@ -1125,27 +1131,34 @@
     }
 
     function afterSecondOnline(){
+      if(memResolving || !memState) return;
       const a=memState.faceUp[0], b=memState.faceUp[1];
       if(a==null || b==null) return;
 
-      memState.moves++;
+      memResolving=true;
       const same=memState.deck[a]===memState.deck[b];
 
       if(same){
+        memState.moves++;
         memState.matched.push(a,b);
         memState.faceUp=[];
         memState.scores[memState.turn]++;
+        memState.seq++;
         if(memState.matched.length===TOTAL) memState.finished=true;
-        sendMem({type:"state",room:memRoom,state:serializeMem()});
         renderMemGame();
+        void sendMem({type:"state",room:memRoom,state:serializeMem()});
+        memResolving=false;
         if(memState.finished) finishMemory();
       }else{
         renderMemGame();
         clearTimeout(memResolveTimer);
         memResolveTimer=setTimeout(async()=>{
+          if(!memState) return;
+          memState.moves++;
           memState.faceUp=[];
           memState.turn=memState.turn===0?1:0;
           memState.seq++;
+          memResolving=false;
           renderMemGame();
           await sendMem({type:"state",room:memRoom,state:serializeMem()});
           updateMemTurnFlow();
@@ -1154,7 +1167,7 @@
     }
 
     function handleMemCard(index){
-      if(!memState || memState.finished) return;
+      if(!memState || memState.finished || memResolving) return;
       if(memState.turn !== currentMemPlayerIndex()) return;
       if(memState.faceUp.includes(index) || memState.matched.includes(index) || memState.faceUp.length>=2) return;
 
@@ -1164,11 +1177,12 @@
       renderMemGame();
 
       if(memMode==="online"){
-        sendMem({type:"state",room:memRoom,state:serializeMem()});
+        void sendMem({type:"state",room:memRoom,state:serializeMem()});
       }
 
       if(memState.faceUp.length===2){
-        afterSecondOnline();
+        if(memMode==="online") afterSecondOnline();
+        else afterSecondOnline();
       }
     }
 
@@ -1315,6 +1329,7 @@
       memMode="bot";
       memRole="";
       memFinished=false;
+      memResolving=false;
       botMemory.clear();
       clearTimeout(memBotTimer); clearTimeout(memResolveTimer);
       if(memClock)clearInterval(memClock);
@@ -1342,6 +1357,7 @@
       memRoom=String(roomCode||"").replace(/[^a-z0-9]/gi,'').toUpperCase().slice(0,8);
       memPlayer=makeMemPlayer();
       memFinished=false;
+      memResolving=false;
       memWaitingForHost=true;
       memSubscribed=false;
 
