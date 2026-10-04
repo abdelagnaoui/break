@@ -1097,7 +1097,8 @@
 
     async function sendMem(payload){
       if(!memChannel || !memSubscribed) return;
-      await memChannel.send({type:"broadcast",event:"memory",payload});
+      const enriched={...payload,from:memPlayer};
+      await memChannel.send({type:"broadcast",event:"memory",payload:enriched});
     }
 
     function serializeMem(){
@@ -1105,7 +1106,7 @@
     }
 
     function applyMemRemote(s){
-      if(!s || !memState) return;
+      if(!s) return;
       memState = {
         deck:[...(s.deck||[])],
         matched:[...(s.matched||[])],
@@ -1390,12 +1391,10 @@
             return;
           }
 
-          if((payload.type==="state" || payload.type==="reset") && memRole==="guest"){
-            if(payload.state){
-              memWaitingForHost=false;
-              applyMemRemote(payload.state);
-              setMemoryStatus("🟢 Connected • Game synchronized");
-            }
+          if((payload.type==="state" || payload.type==="reset") && payload.state && payload.from!==memPlayer){
+            memWaitingForHost=false;
+            applyMemRemote(payload.state);
+            setMemoryStatus("🟢 Connected • Game synchronized");
             return;
           }
         })
