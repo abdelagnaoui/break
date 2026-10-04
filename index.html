@@ -939,6 +939,9 @@
     let memFinished = false;
     let memWaitingForHost = false;
     let memResolving = false;
+    let memPeerPlayer = "";
+    let memHandshakeTimer = null;
+    let memHandshakeDone = false;
 
     // Bot memory is intentionally imperfect.
     // It remembers only some cards and can forget old ones, so it does not "know everything".
@@ -1356,10 +1359,13 @@
       memRole=role;
       memRoom=String(roomCode||"").replace(/[^a-z0-9]/gi,'').toUpperCase().slice(0,8);
       memPlayer=makeMemPlayer();
+      memPeerPlayer="";
       memFinished=false;
       memResolving=false;
       memWaitingForHost=true;
       memSubscribed=false;
+      memHandshakeDone=false;
+      clearInterval(memHandshakeTimer); memHandshakeTimer=null;
 
       // Close any stale channel before joining a new Memory room.
       if(memChannel){
@@ -1367,27 +1373,47 @@
         memChannel=null;
       }
 
+      if(memRoom.length<4) throw new Error("Invalid room code.");
+
       const channelName="break-memory-"+memRoom.toLowerCase();
       memChannel=memClient.channel(channelName,{
         config:{
-          broadcast:{self:false},
+          broadcast:{self:false,ack:true},
           presence:{key:memPlayer}
         }
       });
 
+      const pushState=async()=>{
+        if(!memChannel || !memSubscribed || !memState) return;
+        try{
+          await sendMem({type:"state",room:memRoom,state:serializeMem()});
+        }catch{}
+      };
+
       const roomHello=async()=>{
-        if(memRole!=="guest" || !memSubscribed || !memChannel) return;
-        try{await sendMem({type:"hello",room:memRoom,from:memPlayer,ts:Date.now()});}catch{}
+        if(memRole!=="guest" || !memSubscribed || !memChannel || memHandshakeDone) return;
+        try{
+          await sendMem({type:"hello",room:memRoom,from:memPlayer,ts:Date.now()});
+        }catch{}
       };
 
       const checkPresence=async()=>{
         if(!memChannel) return;
-        const count=Object.keys(memChannel.presenceState()||{}).length;
+        const state=memChannel.presenceState()||{};
+        const peers=Object.entries(state);
+        const other=peers.find(([key,items])=>{
+          const item=Array.isArray(items)?items[0]:items;
+          return key!==memPlayer && item?.role;
+        });
+        if(other) memPeerPlayer=other[0];
+        const count=peers.length;
+
         if(memRole==="host"){
           if(count>=2){
             memWaitingForHost=false;
             if(!memState) startMemOnline(true);
-            else await sendMem({type:"state",room:memRoom,state:serializeMem()});
+            memHandshakeDone=true;
+            await pushState();
             if(document.getElementById("memoryOnlineStatus")) setMemoryStatus("🟢 Friend connected • Player 1 starts");
           }
         }else if(count>=2){
@@ -1396,30 +1422,60 @@
       };
 
       memChannel
-        .on("broadcast",{event:"memory"},({payload})=>{
-          if(!payload || payload.room!==memRoom) return;
+        .on("broadcast",{event:"memory"},async({payload})=>{
+          if(!payload || payload.room!==memRoom || payload.from===memPlayer) return;
 
           if(payload.type==="hello" && memRole==="host"){
+            memPeerPlayer=payload.from||memPeerPlayer;
             memWaitingForHost=false;
             if(!memState) startMemOnline(true);
-            else sendMem({type:"state",room:memRoom,state:serializeMem()});
+            memHandshakeDone=true;
+            // Send a welcome/state several times so a guest opening a shared
+            // link does not get stuck if the first broadcast lands too early.
+            for(const delay of [0,180,500,1000]){
+              setTimeout(()=>{ if(memRole==="host" && memChannel && memState) void pushState(); },delay);
+            }
             setMemoryStatus("🟢 Friend connected • Player 1 starts");
             return;
           }
 
-          if((payload.type==="state" || payload.type==="reset") && payload.state && payload.from!==memPlayer){
+          if(payload.type==="ready" && memRole==="host"){
+            memPeerPlayer=payload.from||memPeerPlayer;
             memWaitingForHost=false;
+            memHandshakeDone=true;
+            await pushState();
+            setMemoryStatus("🟢 Friend connected • Player 1 starts");
+            return;
+          }
+
+          if(payload.type==="state" && payload.state){
+            memPeerPlayer=payload.from||memPeerPlayer;
+            memWaitingForHost=false;
+            memHandshakeDone=true;
             applyMemRemote(payload.state);
             setMemoryStatus("🟢 Connected • Game synchronized");
+            if(memRole==="guest"){
+              try{await sendMem({type:"ready",room:memRoom,stateSeq:Number(payload.state.seq)||0,to:payload.from||""});}catch{}
+            }
             return;
           }
         })
-        .on("presence",{event:"sync"},()=>{ checkPresence(); })
-        .on("presence",{event:"join"},()=>{ checkPresence(); });
+        .on("presence",{event:"sync"},()=>{ void checkPresence(); })
+        .on("presence",{event:"join"},()=>{ void checkPresence(); })
+        .on("presence",{event:"leave"},()=>{
+          if(memMode==="online" && !memFinished){
+            const count=Object.keys(memChannel?.presenceState?.()||{}).length;
+            if(count<2){
+              memHandshakeDone=false;
+              memPeerPlayer="";
+              if(memState) setMemoryStatus("🔴 Friend disconnected • Waiting for player…");
+            }
+          }
+        });
 
       await new Promise((resolve,reject)=>{
         let settled=false;
-        const timer=setTimeout(()=>{if(!settled) reject(new Error("Could not connect to online game."));},9000);
+        const timer=setTimeout(()=>{if(!settled) reject(new Error("Could not connect to online game."));},12000);
         memChannel.subscribe(st=>{
           if(st==="SUBSCRIBED"){
             settled=true;clearTimeout(timer);memSubscribed=true;resolve(st);
@@ -1436,19 +1492,23 @@
 
       if(memRole==="host"){
         showMemoryWaiting();
-        // Give Presence/Broadcast a moment to settle, then check again.
-        setTimeout(checkPresence,120);
-        setTimeout(checkPresence,700);
-        setTimeout(checkPresence,1500);
+        // Check several times because Presence sync can settle a little later.
+        [100,350,800,1600,3000,5000].forEach(ms=>setTimeout(()=>{void checkPresence()},ms));
+        // Keep announcing the room while waiting for a guest.
+        memHandshakeTimer=setInterval(()=>{
+          if(memRole!=="host" || !memChannel) return;
+          void checkPresence();
+          if(memState && !memFinished) void pushState();
+        },2500);
       }else{
         showMemoryWaiting();
-        // Do not rely on a single Broadcast packet: retry the handshake briefly.
+        // Shared-link guest: keep saying HELLO until the host answers with state.
         await roomHello();
-        const retryTimes=[500,1200,2200,3500,5000,7000];
-        retryTimes.forEach(ms=>setTimeout(()=>{if(memWaitingForHost) roomHello();},ms));
+        [250,700,1400,2400,3600,5200,7600].forEach(ms=>setTimeout(()=>{void roomHello()},ms));
+        memHandshakeTimer=setInterval(()=>{void roomHello()},2500);
         setTimeout(()=>{
-          if(memWaitingForHost) setMemoryStatus("❌ Room not found or host is offline.");
-        },8500);
+          if(memWaitingForHost) setMemoryStatus("❌ Room not found or the host is offline.");
+        },10000);
       }
     }
 
@@ -1543,6 +1603,8 @@
         try{memChannel.unsubscribe()}catch{}
       }
       memBotTimer=memResolveTimer=memClock=null;
+      clearInterval(memHandshakeTimer); memHandshakeTimer=null;
+      memPeerPlayer=""; memHandshakeDone=false;
       memChannel=null; memClient=null; memState=null;
       memSubscribed=false; memFinished=false;
     };
