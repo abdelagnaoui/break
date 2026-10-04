@@ -939,6 +939,14 @@
     let memFinished = false;
     let memWaitingForHost = false;
 
+    // Bot memory is intentionally imperfect.
+    // It remembers only some cards and can forget old ones, so it does not "know everything".
+    let botMemory = new Map(); // cardIndex -> {symbol, confidence, seenAt}
+    const BOT_REMEMBER_CHANCE = 0.58;
+    const BOT_PAIR_CHANCE = 0.42;
+    const BOT_SINGLE_MATCH_CHANCE = 0.34;
+    const BOT_FORGET_CHANCE = 0.16;
+
     function randomMemRoom(){
       const a = new Uint8Array(4);
       crypto.getRandomValues(a);
@@ -1150,6 +1158,7 @@
       if(memState.faceUp.includes(index) || memState.matched.includes(index) || memState.faceUp.length>=2) return;
 
       memState.faceUp.push(index);
+      if(memMode==="bot") rememberBotCards([index]);
       memState.seq++;
       renderMemGame();
 
@@ -1182,50 +1191,119 @@
       }
     }
 
+    function rememberBotCards(indices){
+      if(!Array.isArray(indices)) return;
+      indices.forEach(index=>{
+        if(!Number.isInteger(index)) return;
+        if(Math.random() > BOT_REMEMBER_CHANCE) return;
+        if(!memState || memState.matched.includes(index)) return;
+        botMemory.set(index,{
+          symbol:memState.deck[index],
+          confidence:0.55 + Math.random()*0.35,
+          seenAt:Date.now()
+        });
+      });
+    }
+
+    function forgetBotMemory(){
+      for(const [index, info] of botMemory.entries()){
+        if(!memState || memState.matched.includes(index) || Math.random() < BOT_FORGET_CHANCE){
+          botMemory.delete(index);
+          continue;
+        }
+        info.confidence = Math.max(0.2, info.confidence - 0.04);
+        if(Math.random() < 0.08) botMemory.delete(index);
+      }
+    }
+
+    function chooseBotCards(){
+      const available=[];
+      for(let i=0;i<TOTAL;i++){
+        if(!memState.matched.includes(i)) available.push(i);
+      }
+      if(available.length<2) return null;
+
+      // Only trusted remembered cards are available to the bot.
+      const known = available.filter(i=>{
+        const m=botMemory.get(i);
+        return m && m.confidence>=0.55;
+      });
+
+      // Sometimes use a remembered exact pair, but not too often.
+      if(Math.random() < BOT_PAIR_CHANCE){
+        for(const first of known.sort(()=>Math.random()-0.5)){
+          const info=botMemory.get(first);
+          if(!info) continue;
+          const mate=known.find(i=>i!==first && botMemory.get(i)?.symbol===info.symbol);
+          if(mate && Math.random() < ((info.confidence + botMemory.get(mate).confidence)/2)){
+            return [first,mate];
+          }
+        }
+      }
+
+      // Sometimes remember one card and make a reasonable guess.
+      if(known.length && Math.random() < BOT_SINGLE_MATCH_CHANCE){
+        const first=known[Math.floor(Math.random()*known.length)];
+        const info=botMemory.get(first);
+        const possible=available.filter(i=>i!==first && !memState.faceUp.includes(i));
+        if(info && possible.length){
+          const shuffled=possible.sort(()=>Math.random()-0.5);
+          return [first, shuffled[0]];
+        }
+      }
+
+      // Otherwise, play mostly randomly.
+      const pool=[...available].sort(()=>Math.random()-0.5);
+      return [pool[0],pool[1]];
+    }
+
     function botTurn(){
       if(memMode!=="bot" || !memState || memState.finished || memState.turn!==1) return;
+
+      clearTimeout(memBotTimer);
+      forgetBotMemory();
+
       memBotTimer=setTimeout(()=>{
         if(!memState || memState.finished || memState.turn!==1) return;
 
-        const available=[];
-        for(let i=0;i<TOTAL;i++){
-          if(!memState.matched.includes(i)) available.push(i);
-        }
-        if(available.length<2) return;
+        const pick=chooseBotCards();
+        if(!pick) return;
 
-        let a,b;
-        if(Math.random()<0.72){
-          const first=available[Math.floor(Math.random()*available.length)];
-          const mate=available.find(i=>i!==first && memState.deck[i]===memState.deck[first]);
-          if(mate && Math.random()<0.72){ a=first; b=mate; }
-        }
-        if(a==null){
-          a=available[Math.floor(Math.random()*available.length)];
-          do{b=available[Math.floor(Math.random()*available.length)]}while(b===a);
-        }
-
+        const [a,b]=pick;
         memState.faceUp=[a,b];
         memState.moves++;
+        rememberBotCards([a,b]);
         renderMemGame();
 
+        clearTimeout(memBotTimer);
         memBotTimer=setTimeout(()=>{
-          if(!memState || memState.finished) return;
+          if(!memState || memState.finished || memState.turn!==1) return;
+
           const same=memState.deck[a]===memState.deck[b];
+
+          // The bot sees both cards now, regardless of whether it "remembered" them at first.
+          rememberBotCards([a,b]);
+
           if(same){
             memState.matched.push(a,b);
             memState.faceUp=[];
             memState.scores[1]++;
             if(memState.matched.length===TOTAL) memState.finished=true;
             renderMemGame();
-            if(memState.finished) finishMemory();
-            else botTurn(); // correct answer = bot continues
+
+            if(memState.finished){
+              finishMemory();
+            }else{
+              // Correct answer: bot keeps the turn.
+              botTurn();
+            }
           }else{
             memState.faceUp=[];
-            memState.turn=0; // wrong answer = player's turn
+            memState.turn=0; // Wrong answer: turn goes to the player.
             renderMemGame();
           }
-        },650);
-      },420);
+        },700);
+      },520);
     }
 
     function updateMemTurnFlow(){
@@ -1236,6 +1314,7 @@
       memMode="bot";
       memRole="";
       memFinished=false;
+      botMemory.clear();
       clearTimeout(memBotTimer); clearTimeout(memResolveTimer);
       if(memClock)clearInterval(memClock);
 
@@ -1259,10 +1338,17 @@
       await ensureMemSupabase();
       memMode="online";
       memRole=role;
-      memRoom=roomCode;
+      memRoom=String(roomCode||"").replace(/[^a-z0-9]/gi,'').toUpperCase().slice(0,8);
       memPlayer=makeMemPlayer();
       memFinished=false;
       memWaitingForHost=true;
+      memSubscribed=false;
+
+      // Close any stale channel before joining a new Memory room.
+      if(memChannel){
+        try{await memChannel.unsubscribe()}catch{}
+        memChannel=null;
+      }
 
       const channelName="break-memory-"+memRoom.toLowerCase();
       memChannel=memClient.channel(channelName,{
@@ -1272,6 +1358,26 @@
         }
       });
 
+      const roomHello=async()=>{
+        if(memRole!=="guest" || !memSubscribed || !memChannel) return;
+        try{await sendMem({type:"hello",room:memRoom,from:memPlayer,ts:Date.now()});}catch{}
+      };
+
+      const checkPresence=async()=>{
+        if(!memChannel) return;
+        const count=Object.keys(memChannel.presenceState()||{}).length;
+        if(memRole==="host"){
+          if(count>=2){
+            memWaitingForHost=false;
+            if(!memState) startMemOnline(true);
+            else await sendMem({type:"state",room:memRoom,state:serializeMem()});
+            if(document.getElementById("memoryOnlineStatus")) setMemoryStatus("🟢 Friend connected • Player 1 starts");
+          }
+        }else if(count>=2){
+          await roomHello();
+        }
+      };
+
       memChannel
         .on("broadcast",{event:"memory"},({payload})=>{
           if(!payload || payload.room!==memRoom) return;
@@ -1279,36 +1385,32 @@
           if(payload.type==="hello" && memRole==="host"){
             memWaitingForHost=false;
             if(!memState) startMemOnline(true);
-            sendMem({type:"state",room:memRoom,state:serializeMem()});
+            else sendMem({type:"state",room:memRoom,state:serializeMem()});
+            setMemoryStatus("🟢 Friend connected • Player 1 starts");
             return;
           }
 
-          if(payload.type==="state" && memRole==="guest"){
+          if((payload.type==="state" || payload.type==="reset") && memRole==="guest"){
             if(payload.state){
               memWaitingForHost=false;
               applyMemRemote(payload.state);
+              setMemoryStatus("🟢 Connected • Game synchronized");
             }
             return;
-          }
-
-          if(payload.type==="reset" && memRole==="guest"){
-            if(payload.state){
-              memWaitingForHost=false;
-              applyMemRemote(payload.state);
-            }
           }
         })
-        .on("presence",{event:"sync"},()=>{
-          if(memRole==="host"){
-            const count=Object.keys(memChannel.presenceState()||{}).length;
-            if(count>=2 && !memState) startMemOnline(true);
-          }
-        });
+        .on("presence",{event:"sync"},()=>{ checkPresence(); })
+        .on("presence",{event:"join"},()=>{ checkPresence(); });
 
       await new Promise((resolve,reject)=>{
+        let settled=false;
+        const timer=setTimeout(()=>{if(!settled) reject(new Error("Could not connect to online game."));},9000);
         memChannel.subscribe(st=>{
-          if(st==="SUBSCRIBED"){memSubscribed=true;resolve(st)}
-          else if(st==="CHANNEL_ERROR" || st==="TIMED_OUT") reject(new Error("Could not connect to online game."));
+          if(st==="SUBSCRIBED"){
+            settled=true;clearTimeout(timer);memSubscribed=true;resolve(st);
+          }else if(st==="CHANNEL_ERROR" || st==="TIMED_OUT"){
+            settled=true;clearTimeout(timer);reject(new Error("Could not connect to online game."));
+          }
         });
       });
 
@@ -1318,18 +1420,20 @@
       gameWrap.style.display="flex";
 
       if(memRole==="host"){
-        memRoom=roomCode;
-        if(!memState){
-          showMemoryWaiting();
-        }else{
-          renderMemGame();
-        }
+        showMemoryWaiting();
+        // Give Presence/Broadcast a moment to settle, then check again.
+        setTimeout(checkPresence,120);
+        setTimeout(checkPresence,700);
+        setTimeout(checkPresence,1500);
       }else{
         showMemoryWaiting();
-        await sendMem({type:"hello",room:memRoom,from:memPlayer});
+        // Do not rely on a single Broadcast packet: retry the handshake briefly.
+        await roomHello();
+        const retryTimes=[500,1200,2200,3500,5000,7000];
+        retryTimes.forEach(ms=>setTimeout(()=>{if(memWaitingForHost) roomHello();},ms));
         setTimeout(()=>{
           if(memWaitingForHost) setMemoryStatus("❌ Room not found or host is offline.");
-        },3500);
+        },8500);
       }
     }
 
@@ -2587,7 +2691,7 @@
       shuffle(pieces,mulberry32(hashSeed(seedKey+'|'+safeIndex+'|shuffle')));
       // Avoid starting already solved. With swap-based play there are no dead-end positions.
       if(pieces.every((v,i)=>v===i)) [pieces[0],pieces[1]]=[pieces[1],pieces[0]];
-      puzzleState={art,artIndex:safeIndex,positions:pieces,selected:null,drag:null,moves:0,correct:0,startedAt:0,finished:false};
+      puzzleState={art,artIndex:safeIndex,positions:pieces,selected:null,drag:null,moves:0,correct:0,startedAt:0,finished:false,syncVersion:0};
       renderPuzzle();
     }
 
@@ -2779,13 +2883,40 @@
     async function handlePacket(payload){
       if(!payload||payload.room!==room)return;
       if(payload.type==='hello'&&isHost&&!onlineStarted){handlePresence();return}
+      if(payload.type==='hello'&&isHost&&onlineStarted&&puzzleState){broadcastProgress(false,null);return}
       if(payload.type==='start'&&!isHost){seed=payload.seed||room;startRace(payload.startedAt,Number(payload.artIndex)||0);return}
+      if(payload.type==='state'&&mode==='online'&&payload.from!==playerId){
+        const incomingVersion=Number(payload.version)||0;
+        const localVersion=Number(puzzleState?.syncVersion)||0;
+        if(incomingVersion<localVersion)return;
+        if(Array.isArray(payload.positions)&&payload.positions.length===TOTAL&&puzzleState){
+          puzzleState.positions=payload.positions.map(Number);
+          puzzleState.moves=Math.max(puzzleState.moves,Number(payload.moves)||0);
+          puzzleState.syncVersion=incomingVersion;
+          puzzleState.selected=null;
+          puzzleState.drag=null;
+          renderPuzzle();
+          const oppFill=document.getElementById('pOppFill');if(oppFill)oppFill.style.width=Math.round((Number(payload.correct)||0)/TOTAL*100)+'%';
+          const oppLbl=document.getElementById('pOppLabel');if(oppLbl)oppLbl.textContent=`Friend: ${Number(payload.correct)||0} / ${TOTAL}`;
+          if(payload.done){
+            const winner=document.getElementById('puzzleResult');
+            if(winner&&!puzzleState.finished)winner.innerHTML=`<div class="puzzle-win"><strong>🏁 Friend finished first!</strong><span>The shared board is synced with your friend.</span></div>`;
+          }
+        }
+        return;
+      }
       if(payload.type==='progress'&&mode==='online'){
         const pctv=Math.round((Number(payload.correct)||0)/TOTAL*100);const fill=document.getElementById('pOppFill');if(fill)fill.style.width=pctv+'%';const lbl=document.getElementById('pOppLabel');if(lbl)lbl.textContent=`Friend: ${Number(payload.correct)||0} / ${TOTAL}`;
         if(payload.done){const winner=document.getElementById('puzzleResult');if(winner&&!puzzleState.finished)winner.innerHTML=`<div class="puzzle-win"><strong>🏁 Friend finished first!</strong><span>Finish yours to see your time.</span></div>`}
       }
     }
-    async function broadcastProgress(done=false,elapsedMs=null){if(!(mode==='online'&&channel&&subscribed&&puzzleState))return;const correct=puzzleCorrectCount();await channel.send({type:'broadcast',event:'puzzle',payload:{type:'progress',room,from:playerId,correct,moves:puzzleState.moves,done,elapsedMs}})}
+    async function broadcastProgress(done=false,elapsedMs=null){
+      if(!(mode==='online'&&channel&&subscribed&&puzzleState))return;
+      puzzleState.syncVersion=(Number(puzzleState.syncVersion)||0)+1;
+      const correct=puzzleCorrectCount();
+      const payload={type:'state',room,from:playerId,version:puzzleState.syncVersion,positions:[...puzzleState.positions],correct,moves:puzzleState.moves,done,elapsedMs};
+      try{await channel.send({type:'broadcast',event:'puzzle',payload})}catch{}
+    }
     async function createOnline(){try{await setupRoom('host',randomRoom())}catch(e){setOnlineStatus('❌ '+e.message)}}
     async function joinOnline(code){const clean=String(code||'').replace(/[^a-z0-9]/gi,'').toUpperCase().slice(0,8);if(clean.length<4){setOnlineStatus('Enter a valid room code.');return}try{await setupRoom('guest',clean)}catch(e){setOnlineStatus('❌ '+e.message)}}
 
