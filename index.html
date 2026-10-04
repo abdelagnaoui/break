@@ -884,8 +884,10 @@
 
   closeModal.addEventListener("click", closeTool);
 
+  // Keep the game open when clicking empty/background space.
+  // The modal is closed explicitly with the X button (or Escape).
   modalBg.addEventListener("click", e => {
-    if(e.target === modalBg) closeTool();
+    e.stopPropagation();
   });
 
   document.addEventListener("keydown", e => {
