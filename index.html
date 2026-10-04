@@ -1548,7 +1548,19 @@
     };
 
     if(autoRoom){
-      onlineBtn.click();
+      // Shared Memory link: open the online game directly, without showing the
+      // Online mode menu / Join Game UI first.
+      menu.style.display="none";
+      onlineSetup.style.display="none";
+      gameWrap.style.display="flex";
+      showMemoryWaiting();
+      setMemoryStatus("🟡 Opening shared game…");
+      void connectMemOnline("guest",autoRoom).catch(e=>{
+        gameWrap.innerHTML=`<div class="puzzle-share" style="width:min(620px,100%);display:flex;flex-direction:column;gap:10px;">
+          <div class="stage-title">⚠️ Could not open game</div>
+          <div class="stats">${e?.message||"Unable to connect to this room."}</div>
+        </div>`;
+      });
     }
   }
 
